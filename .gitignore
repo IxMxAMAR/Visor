@@ -10,3 +10,8 @@ target/
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+# Local-only user-space bridge and overlay UI (not part of the published hypervisor)
+overlay/
+src/windows/win_hv/src/cheat.rs
+src/windows/win_hv/src/ioctl.rs

@@ -29,7 +29,7 @@ use crate::hypervisor::{
     x86_instructions::{cr0, cr3, cr4, lar, ldtr, lsl, rdmsr, sgdt, sidt, tr, write_cr2},
 };
 
-use super::epts::Epts;
+use super::epts::EptManager;
 
 /// Representation of a guest.
 pub(crate) struct VmxGuest {
@@ -89,8 +89,20 @@ impl Guest for VmxGuest {
         const VMX_EXIT_REASON_INIT: u16 = 3;
         const VMX_EXIT_REASON_SIPI: u16 = 4;
         const VMX_EXIT_REASON_CPUID: u16 = 10;
+        const VMX_EXIT_REASON_VMCALL: u16 = 18;
+        const VMX_EXIT_REASON_VMCLEAR: u16 = 19;
+        const VMX_EXIT_REASON_VMLAUNCH: u16 = 20;
+        const VMX_EXIT_REASON_VMPTRLD: u16 = 21;
+        const VMX_EXIT_REASON_VMPTRST: u16 = 22;
+        const VMX_EXIT_REASON_VMREAD: u16 = 23;
+        const VMX_EXIT_REASON_VMRESUME: u16 = 24;
+        const VMX_EXIT_REASON_VMWRITE: u16 = 25;
+        const VMX_EXIT_REASON_VMXOFF: u16 = 26;
+        const VMX_EXIT_REASON_VMXON: u16 = 27;
+        const VMX_EXIT_REASON_CR_ACCESS: u16 = 28;
         const VMX_EXIT_REASON_RDMSR: u16 = 31;
         const VMX_EXIT_REASON_WRMSR: u16 = 32;
+        const VMX_EXIT_REASON_EPT_VIOLATION: u16 = 48;
         const VMX_EXIT_REASON_XSETBV: u16 = 55;
 
         vmwrite(vmcs::guest::RIP, self.registers.rip);
@@ -109,8 +121,13 @@ impl Guest for VmxGuest {
         self.registers.rsp = vmread(vmcs::guest::RSP);
         self.registers.rflags = vmread(vmcs::guest::RFLAGS);
 
+        // Log every exit for serial debugging on real hardware.
+        let exit_reason = vmread(vmcs::ro::EXIT_REASON) as u16;
+        log::trace!("VMEXIT reason={exit_reason:#x} rip={:#x}", self.registers.rip);
+
         // Return VM-exit reason.
-        match vmread(vmcs::ro::EXIT_REASON) as u16 {
+        match exit_reason {
+            #[allow(clippy::match_same_arms)]
             VMX_EXIT_REASON_INIT => {
                 self.handle_init_signal();
                 VmExitReason::InitSignal
@@ -122,21 +139,47 @@ impl Guest for VmxGuest {
             VMX_EXIT_REASON_CPUID => VmExitReason::Cpuid(InstructionInfo {
                 next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
             }),
+            VMX_EXIT_REASON_VMCALL => VmExitReason::Vmcall(InstructionInfo {
+                next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
+            }),
+            // All VMX instructions executed by the guest (Hyper-V) cause exits.
+            // Return VMfailInvalid (CF=1) so Hyper-V sees them as unsupported
+            // rather than hanging the system.
+            VMX_EXIT_REASON_VMCLEAR
+            | VMX_EXIT_REASON_VMLAUNCH
+            | VMX_EXIT_REASON_VMPTRLD
+            | VMX_EXIT_REASON_VMPTRST
+            | VMX_EXIT_REASON_VMREAD
+            | VMX_EXIT_REASON_VMRESUME
+            | VMX_EXIT_REASON_VMWRITE
+            | VMX_EXIT_REASON_VMXOFF
+            | VMX_EXIT_REASON_VMXON => VmExitReason::VmxInstruction(InstructionInfo {
+                next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
+            }),
+            VMX_EXIT_REASON_CR_ACCESS => VmExitReason::CrAccess(InstructionInfo {
+                next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
+            }),
             VMX_EXIT_REASON_RDMSR => VmExitReason::Rdmsr(InstructionInfo {
                 next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
             }),
             VMX_EXIT_REASON_WRMSR => VmExitReason::Wrmsr(InstructionInfo {
                 next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
             }),
+            VMX_EXIT_REASON_EPT_VIOLATION => VmExitReason::EptViolation {
+                gpa:  vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL),
+                qual: vmread(vmcs::ro::EXIT_QUALIFICATION),
+            },
             VMX_EXIT_REASON_XSETBV => VmExitReason::XSetBv(InstructionInfo {
                 next_rip: self.registers.rip + vmread(vmcs::ro::VMEXIT_INSTRUCTION_LEN),
             }),
             _ => {
+                let reason = vmread(vmcs::ro::EXIT_REASON);
+                let qual   = vmread(vmcs::ro::EXIT_QUALIFICATION);
+                let gpa    = vmread(vmcs::ro::GUEST_PHYSICAL_ADDR_FULL);
+                let rip    = vmread(vmcs::guest::RIP);
+                log::error!("UNHANDLED VMEXIT reason={reason:#x} qual={qual:#x} gpa={gpa:#x} rip={rip:#x}");
                 log::error!("{:#x?}", self.vmcs);
-                panic!(
-                    "Unhandled VM-exit reason: {:?}",
-                    vmread(vmcs::ro::EXIT_REASON)
-                )
+                panic!("Unhandled VM-exit reason: {reason:#x}")
             }
         }
     }
@@ -215,7 +258,7 @@ impl VmxGuest {
         let msr_bitmaps_va = SHARED_GUEST_DATA.msr_bitmaps.as_ref() as *const _;
         let msr_bitmaps_pa = platform_ops::get().pa(msr_bitmaps_va as *const _);
         vmwrite(vmcs::control::MSR_BITMAPS_ADDR_FULL, msr_bitmaps_pa);
-        vmwrite(vmcs::control::EPTP_FULL, SHARED_GUEST_DATA.epts.eptp().0);
+        vmwrite(vmcs::control::EPTP_FULL, SHARED_GUEST_DATA.ept_manager.lock().eptp().0);
     }
 
     /// Initializes the guest-state fields of the VMCS.
@@ -633,18 +676,29 @@ impl VmxGuest {
 
 struct SharedGuestData {
     msr_bitmaps: Box<Page>,
-    epts: Box<Epts>,
+    /// Guarded so EPT modifications from the violation handler are race-free.
+    ept_manager: spin::Mutex<EptManager>,
 }
 
-static SHARED_GUEST_DATA: Lazy<SharedGuestData> = Lazy::new(|| {
-    let mut epts = zeroed_box::<Epts>();
-    epts.build_identity();
-
-    SharedGuestData {
-        msr_bitmaps: zeroed_box::<Page>(),
-        epts,
-    }
+static SHARED_GUEST_DATA: Lazy<SharedGuestData> = Lazy::new(|| SharedGuestData {
+    msr_bitmaps: zeroed_box::<Page>(),
+    ept_manager: spin::Mutex::new(EptManager::new()),
 });
+
+/// Handles an EPT violation on behalf of the architecture-agnostic host loop.
+pub(crate) fn handle_ept_violation(gpa: u64) {
+    SHARED_GUEST_DATA.ept_manager.lock().handle_violation(gpa);
+}
+
+/// Remaps the GPA to the dummy page — called via `VMCALL_HIDE_PAGE`.
+pub(crate) fn hide_page_hypercall(gpa: u64) {
+    SHARED_GUEST_DATA.ept_manager.lock().remap_page_to_dummy(gpa);
+}
+
+/// Restores identity mapping for `gpa` — called via `VMCALL_UNHIDE_PAGE`.
+pub(crate) fn unhide_page_hypercall(gpa: u64) {
+    SHARED_GUEST_DATA.ept_manager.lock().restore_page(gpa);
+}
 
 unsafe extern "C" {
     /// Runs the guest until VM-exit occurs.

@@ -1,2 +1,6 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+WDKContentRoot = "C:\\Users\\amren\\wdk-root\\"
+LIBCLANG_PATH  = "C:\\Program Files\\LLVM\\bin"

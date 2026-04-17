@@ -12,7 +12,7 @@ use crate::hypervisor::{
     x86_instructions::{cr4, cr4_write, rdmsr, wrmsr, xsetbv},
 };
 
-use super::{amd::Amd, intel::Intel};
+use super::{amd::Amd, vmcall, intel::{handle_ept_violation, Intel}};
 
 /// The entry point of the hypervisor.
 pub(crate) fn main(registers: &Registers) -> ! {
@@ -61,12 +61,17 @@ fn virtualize_core<Arch: Architecture>(registers: &Registers) -> ! {
         // Then, run the guest until VM-exit occurs. Some of events are handled
         // within the architecture specific code and nothing to do here.
         match guest.run() {
-            VmExitReason::Cpuid(info) => handle_cpuid(guest, &info),
-            VmExitReason::Rdmsr(info) => handle_rdmsr(guest, &info),
-            VmExitReason::Wrmsr(info) => handle_wrmsr(guest, &info),
-            VmExitReason::XSetBv(info) => handle_xsetbv(guest, &info),
-            VmExitReason::InitSignal | VmExitReason::StartupIpi | VmExitReason::NestedPageFault => {
-            }
+            VmExitReason::Cpuid(info)          => handle_cpuid(guest, &info),
+            VmExitReason::Vmcall(info)         => handle_vmcall(guest, &info),
+            VmExitReason::Rdmsr(info)          => handle_rdmsr(guest, &info),
+            VmExitReason::Wrmsr(info)          => handle_wrmsr(guest, &info),
+            VmExitReason::XSetBv(info)         => handle_xsetbv(guest, &info),
+            VmExitReason::VmxInstruction(info) => handle_vmx_instruction(guest, &info),
+            VmExitReason::CrAccess(info)       => handle_cr_access(guest, &info),
+            VmExitReason::EptViolation { gpa, .. } => handle_ept_violation(gpa),
+            VmExitReason::InitSignal
+            | VmExitReason::StartupIpi
+            | VmExitReason::NestedPageFault => {}
         }
     }
 }
@@ -78,11 +83,13 @@ fn handle_cpuid<T: Guest>(guest: &mut T, info: &InstructionInfo) {
     let mut cpuid_result = cpuid!(leaf, sub_leaf);
 
     if leaf == 1 {
-        // On the Intel processor, CPUID.1.ECX[5] indicates if VT-x is supported.
-        // Clear this to prevent other hypervisor tries to use it. On AMD, it is
-        // a reserved bit.
+        // Clear VT-x supported bit so nested hypervisors cannot use it.
         // See: Table 3-10. Feature Information Returned in the ECX Register
         cpuid_result.ecx &= !(1 << 5);
+
+        // Clear Hypervisor Present bit (ECX[31]). Detection software reads this
+        // to find virtualization — we hide it so we appear bare-metal.
+        cpuid_result.ecx &= !(1 << 31);
     } else if leaf == HV_CPUID_VENDOR_AND_MAX_FUNCTIONS {
         // If the hypervisor vendor name is asked, return our hypervisor name,
         // so that `is_our_hypervisor_present` can detect the presence.
@@ -104,6 +111,45 @@ fn handle_cpuid<T: Guest>(guest: &mut T, info: &InstructionInfo) {
     guest.regs().rbx = u64::from(cpuid_result.ebx);
     guest.regs().rcx = u64::from(cpuid_result.ecx);
     guest.regs().rdx = u64::from(cpuid_result.edx);
+    guest.regs().rip = info.next_rip;
+}
+
+/// Handles `VMCALL` from the guest — our ring-0 driver's hypercall interface.
+///
+/// Calling convention:
+/// - RAX = VMCALL code (see `vmcall::VmcallCode`)
+/// - RCX = first argument
+/// - RDX = second argument
+/// - R8  = third argument
+/// - Return value written back into RAX.
+fn handle_vmcall<T: Guest>(guest: &mut T, info: &InstructionInfo) {
+    let code = guest.regs().rax;
+    let arg1 = guest.regs().rcx;
+    let arg2 = guest.regs().rdx;
+    let arg3 = guest.regs().r8;
+    log::trace!("VMCALL code={code:#x} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x}");
+
+    let result = vmcall::dispatch(code, arg1, arg2, arg3);
+    guest.regs().rax = result;
+    guest.regs().rip = info.next_rip;
+}
+
+/// Handles VMX instructions executed by the guest (Hyper-V).
+///
+/// Sets CF=1 (VMfailInvalid) so the guest sees every VMX instruction as
+/// unsupported, then skips over it. Hyper-V interprets this as the CPU not
+/// supporting VMX in its current context and should fall back gracefully.
+fn handle_vmx_instruction<T: Guest>(guest: &mut T, info: &InstructionInfo) {
+    // Set Carry Flag in guest RFLAGS → VMfailInvalid per Intel SDM 31.2.
+    const RFLAGS_CF: u64 = 1 << 0;
+    guest.regs().rflags |= RFLAGS_CF;
+    guest.regs().rip = info.next_rip;
+}
+
+/// Handles CR access exits (Hyper-V writing CR4.VMXE etc.) — passthrough.
+fn handle_cr_access<T: Guest>(guest: &mut T, info: &InstructionInfo) {
+    // We allow all CR reads/writes to pass through unchanged.
+    // The guest's CR values are already reflected in the VMCS guest state.
     guest.regs().rip = info.next_rip;
 }
 
@@ -190,9 +236,23 @@ pub(crate) trait Guest {
 /// The reasons of VM-exit and additional information.
 pub(crate) enum VmExitReason {
     Cpuid(InstructionInfo),
+    /// Guest executed `VMCALL` — our hypercall interface.
+    Vmcall(InstructionInfo),
+    /// Guest (Hyper-V) executed a VMX instruction — return VMfailInvalid.
+    VmxInstruction(InstructionInfo),
+    /// Guest wrote to a control register.
+    CrAccess(InstructionInfo),
     Rdmsr(InstructionInfo),
     Wrmsr(InstructionInfo),
     XSetBv(InstructionInfo),
+    /// EPT page-fault: a guest physical access had no valid EPT mapping.
+    EptViolation {
+        /// Faulting guest physical address.
+        gpa: u64,
+        /// Exit qualification bitmap (access type flags) — reserved for future use.
+        #[expect(dead_code)]
+        qual: u64,
+    },
     InitSignal,
     StartupIpi,
     NestedPageFault,

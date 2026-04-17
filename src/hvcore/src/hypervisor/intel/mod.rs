@@ -9,6 +9,8 @@ mod guest;
 mod mtrr;
 mod vmx;
 
+pub(crate) use guest::{handle_ept_violation, hide_page_hypercall, unhide_page_hypercall};
+
 /// The Intel processor implements VMX as a virtualization extension.
 pub(crate) struct Intel;
 
